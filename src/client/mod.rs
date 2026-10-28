@@ -989,6 +989,8 @@ pub struct Stream {
     framerate: Option<f32>,
     control: Option<Url>,
     direction: StreamDirection,
+    pli: bool,
+    fir: bool,
 }
 
 impl std::fmt::Debug for Stream {
@@ -1002,6 +1004,8 @@ impl std::fmt::Debug for Stream {
             .field("channels", &self.channels)
             .field("framerate", &self.framerate)
             .field("direction", &self.direction)
+            .field("pli", &self.pli)
+            .field("fir", &self.fir)
             .field("depacketizer", &self.depacketizer)
             .field("state", &self.state)
             .finish()
@@ -1057,6 +1061,22 @@ impl Stream {
     #[inline]
     pub fn framerate(&self) -> Option<f32> {
         self.framerate
+    }
+
+    /// Whether the server accepts RTCP picture loss indications (PLI) for this
+    /// stream: its SDP has `a=rtcp-fb:<pt> nack pli` ([RFC 4585 section
+    /// 6.3.1](https://datatracker.ietf.org/doc/html/rfc4585#section-6.3.1)).
+    #[inline]
+    pub fn supports_pli(&self) -> bool {
+        self.pli
+    }
+
+    /// Whether the server accepts RTCP full intra requests (FIR) for this
+    /// stream: its SDP has `a=rtcp-fb:<pt> ccm fir` ([RFC 5104 section
+    /// 4.3.1](https://datatracker.ietf.org/doc/html/rfc5104#section-4.3.1)).
+    #[inline]
+    pub fn supports_fir(&self) -> bool {
+        self.fir
     }
 
     /// Returns the specified control URL.
@@ -1371,6 +1391,13 @@ struct SessionInner {
     /// The state of RTCP receiver reports, iff they're enabled; only used in
     /// state `Playing`.
     reports: Option<ReportState>,
+
+    /// Our SSRC and `CNAME` for keyframe requests when receiver reports are
+    /// off (otherwise `reports`' are used); made on the first request.
+    feedback_writer: Option<receiver_report::ReportWriter>,
+
+    /// The sequence number of our last FIR (RFC 5104 section 4.3.1.1).
+    fir_seq: u8,
 
     /// Bitmask of [`SessionFlag`]s.
     flags: u8,
@@ -1814,6 +1841,8 @@ impl Session<Described> {
                 keepalive_state: KeepaliveState::Idle,
                 keepalive_timer: None,
                 reports: None,
+                feedback_writer: None,
+                fir_seq: 0,
                 flags: 0,
                 udp_next_poll_i: 0,
             }),
@@ -2592,6 +2621,74 @@ impl Session<Playing> {
             .as_mut()
             .reset(tokio::time::Instant::now() + keepalive_interval);
         Ok(())
+    }
+
+    /// Asks the server for a keyframe on stream `stream_i`, with an RTCP PLI
+    /// (or FIR, if that's all its SDP offers) on the stream's RTCP channel or
+    /// socket. Useful after loss (see [`crate::rtp::ReceivedPacket::loss`]) and
+    /// on connecting, so decoding needn't wait out the GOP.
+    ///
+    /// Returns `Ok(false)` without sending anything if the server's SDP offered
+    /// neither for this stream (see [`Stream::supports_pli`]) or the stream
+    /// isn't playing. Until the stream's SSRC is known (from the `SETUP` or
+    /// `PLAY` response, or a received packet), the request names SSRC 0.
+    /// Over TCP the request is queued on the RTSP connection and
+    /// sent as the session is polled; over UDP it's sent right away, or dropped
+    /// if the socket is full (as with receiver reports). Callers should limit
+    /// how often they ask; the server may too.
+    pub fn request_keyframe(&mut self, stream_i: usize) -> Result<bool, Error> {
+        let inner = self.0.as_mut().project();
+        let Some(s) = inner.presentation.streams.get_mut(stream_i) else {
+            bail!(ErrorInt::FailedPrecondition(format!(
+                "no stream {stream_i}"
+            )));
+        };
+        let req = if s.pli {
+            receiver_report::KeyframeRequest::Pli
+        } else if s.fir {
+            *inner.fir_seq = inner.fir_seq.wrapping_add(1);
+            receiver_report::KeyframeRequest::Fir(*inner.fir_seq)
+        } else {
+            return Ok(false);
+        };
+        let StreamState::Playing {
+            ctx,
+            udp_sockets,
+            rtp_handler,
+            ..
+        } = &mut s.state
+        else {
+            return Ok(false);
+        };
+        let writer = match inner.reports.as_ref() {
+            Some(r) => &r.writer,
+            None => inner.feedback_writer.get_or_insert_with(|| {
+                receiver_report::ReportWriter::random(&mut rand::thread_rng())
+            }),
+        };
+        let pkt = writer.write_keyframe_request(rtp_handler.ssrc().unwrap_or(0), req);
+        trace!("requesting a keyframe on stream {stream_i}: {req:?}");
+        match (udp_sockets, &ctx.0) {
+            (Some(sockets), _) => {
+                if let Err(e) = sockets.rtcp.try_send(&pkt) {
+                    debug!("Unable to send keyframe request for stream {stream_i}: {e}");
+                }
+            }
+            (None, StreamContextInner::Tcp(tcp)) => {
+                let conn = inner
+                    .conn
+                    .as_mut()
+                    .ok_or_else(|| wrap!(ErrorInt::FailedPrecondition("no connection".into())))?;
+                conn.inner
+                    .start_send_unpin(OwnedMessage::Data {
+                        channel_id: tcp.rtp_channel_id + 1,
+                        body: Bytes::from(pkt),
+                    })
+                    .map_err(|e| wrap!(e))?;
+            }
+            (None, _) => unreachable!("stream {stream_i} has neither TCP nor UDP context"),
+        }
+        Ok(true)
     }
 
     /// Writes a receiver report for each stream and schedules the next.
@@ -3572,6 +3669,12 @@ pub struct Demuxed {
 }
 
 impl Demuxed {
+    /// Asks the server for a keyframe on stream `stream_i`; see
+    /// [`Session::request_keyframe`].
+    pub fn request_keyframe(&mut self, stream_i: usize) -> Result<bool, Error> {
+        self.session.request_keyframe(stream_i)
+    }
+
     /// Returns the server's version as declared in the `DESCRIBE` response's `a:tool` SDP
     /// attribute.
     pub fn tool(&self) -> Option<&Tool> {
@@ -5031,15 +5134,43 @@ mod tests {
         crate::tokio::UdpPair,
         SocketAddr,
     ) {
+        play_udp_with(
+            options,
+            response(include_bytes!("testdata/reolink_describe.txt")),
+        )
+        .await
+    }
+
+    /// The reolink `DESCRIBE` response with `lines` added to its video media
+    /// description (after its `rtpmap`).
+    fn describe_with(lines: &str) -> (msg::Response, Bytes) {
+        let (mut head, body) = response(include_bytes!("testdata/reolink_describe.txt"));
+        let sdp = std::str::from_utf8(&body).unwrap().replacen(
+            "a=rtpmap:96 H264/90000\r\n",
+            &format!("a=rtpmap:96 H264/90000\r\n{lines}"),
+            1,
+        );
+        head.headers.insert(
+            msg::HeaderName::try_from("Content-Length").unwrap(),
+            msg::HeaderValue::try_from(sdp.len().to_string()).unwrap(),
+        );
+        (head, Bytes::from(sdp))
+    }
+
+    async fn play_udp_with(
+        options: UdpTransportOptions,
+        describe: (msg::Response, Bytes),
+    ) -> (
+        Session<Playing>,
+        crate::tokio::Connection,
+        crate::tokio::UdpPair,
+        SocketAddr,
+    ) {
         let (conn, mut server) = connect_to_mock().await;
         let url = Url::parse("rtsp://192.168.5.206:554/h264Preview_01_main").unwrap();
         let (session, _) = tokio::join!(
             Session::describe_with_conn(conn, SessionOptions::default(), url),
-            req_response(
-                &mut server,
-                msg::Method::DESCRIBE,
-                response(include_bytes!("testdata/reolink_describe.txt"))
-            ),
+            req_response(&mut server, msg::Method::DESCRIBE, describe),
         );
         let mut session = session.unwrap();
         let server_udp = crate::tokio::UdpPair::for_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)).unwrap();
@@ -5162,6 +5293,131 @@ mod tests {
         send(5).await;
         send(7).await;
         assert_eq!(next().await, (7, 0));
+    }
+
+    /// `a=rtcp-fb` lines decide which keyframe requests a stream accepts.
+    #[tokio::test]
+    async fn rtcp_fb_keyframe_support() {
+        init_logging();
+        for (lines, want) in [
+            ("", [(false, false), (false, false)]),
+            ("a=rtcp-fb:96 nack pli\r\n", [(true, false), (false, false)]),
+            ("a=rtcp-fb:96 ccm fir\r\n", [(false, true), (false, false)]),
+            (
+                "a=rtcp-fb:96 nack\r\na=rtcp-fb:96 nack pli\r\na=rtcp-fb:96 ccm fir\r\n",
+                [(true, true), (false, false)],
+            ),
+            // A wildcard within the video description; a different payload type isn't ours.
+            ("a=rtcp-fb:* nack pli\r\n", [(true, false), (false, false)]),
+            (
+                "a=rtcp-fb:97 nack pli\r\n",
+                [(false, false), (false, false)],
+            ),
+        ] {
+            let (mut head, body) = describe_with(lines);
+            head.headers.insert(
+                msg::HeaderName::CSEQ,
+                msg::HeaderValue::try_from("1").unwrap(),
+            );
+            let mut wire = Vec::new();
+            OwnedMessage::Response { head, body }
+                .write(&mut wire)
+                .unwrap();
+            let session = describe_raw(SessionOptions::default(), wire).await.unwrap();
+            let got: Vec<(bool, bool)> = session
+                .streams()
+                .iter()
+                .map(|s| (s.supports_pli(), s.supports_fir()))
+                .collect();
+            assert_eq!(got, want, "{lines:?}");
+        }
+    }
+
+    /// Over UDP, a keyframe request goes from the stream's RTCP socket as a
+    /// compound RR + SDES + PLI naming the stream's SSRC; a stream whose SDP
+    /// offers no feedback gets none.
+    #[tokio::test]
+    async fn udp_keyframe_request() {
+        init_logging();
+        let (session, _server, server_udp, client) = play_udp_with(
+            UdpTransportOptions::default(),
+            describe_with("a=rtcp-fb:96 nack pli\r\n"),
+        )
+        .await;
+        let mut session = session;
+        let mut buf = [0u8; 1500];
+        // The firewall hole punch arrives first.
+        let (n, _) = server_udp.rtcp_socket.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], &HOLE_PUNCH_RTCP[..]);
+        // A packet first, so the stream's SSRC is known (this SETUP response
+        // doesn't say).
+        server_udp
+            .rtp_socket
+            .send_to(&rtp_pkt(0x41d4, 0), client)
+            .await
+            .unwrap();
+        match futures::StreamExt::next(&mut session).await {
+            Some(Ok(PacketItem::Rtp(_))) => {}
+            o => panic!("unexpected item: {o:#?}"),
+        }
+
+        assert!(session.request_keyframe(0).unwrap());
+        let (n, from) = server_udp.rtcp_socket.recv_from(&mut buf).await.unwrap();
+        assert_eq!(from, SocketAddr::new(client.ip(), client.port() + 1));
+        let pkt = &buf[..n];
+        // Starts with an (empty) receiver report, ends with the PLI.
+        assert_eq!(&pkt[..2], &[0x80, 201]);
+        let pli = &pkt[n - 12..];
+        assert_eq!(&pli[..4], &[0x81, 206, 0, 2]);
+        assert_eq!(&pli[8..], &REOLINK_SSRC.to_be_bytes());
+        // Our SSRC, the same in the receiver report and the PLI.
+        assert_eq!(&pli[4..8], &pkt[4..8]);
+
+        // Stream 1 isn't set up, and offers no feedback anyway.
+        assert!(!session.request_keyframe(1).unwrap());
+    }
+
+    /// Over TCP, a keyframe request goes on the stream's interleaved RTCP
+    /// channel as the session is polled.
+    #[tokio::test]
+    async fn tcp_keyframe_request() {
+        init_logging();
+        let (conn, mut server) = connect_to_mock().await;
+        let url = Url::parse("rtsp://192.168.5.206:554/h264Preview_01_main").unwrap();
+        let (session, _) = tokio::join!(
+            Session::describe_with_conn(conn, SessionOptions::default(), url),
+            req_response(
+                &mut server,
+                msg::Method::DESCRIBE,
+                describe_with("a=rtcp-fb:96 nack pli\r\n")
+            ),
+        );
+        let mut session = session.unwrap();
+        tokio::join!(
+            async { session.setup(0, SetupOptions::default()).await.unwrap() },
+            req_response(
+                &mut server,
+                msg::Method::SETUP,
+                response(include_bytes!("testdata/reolink_setup.txt"))
+            ),
+        );
+        let (session, _) = tokio::join!(
+            session.play(PlayOptions::default()),
+            req_response(
+                &mut server,
+                msg::Method::PLAY,
+                response(include_bytes!("testdata/reolink_play.txt"))
+            ),
+        );
+        let mut session = session.unwrap();
+        session.0.keepalive_timer = None;
+        assert!(session.request_keyframe(0).unwrap());
+        let (channel_id, body) = tokio::select! {
+            item = futures::StreamExt::next(&mut session) => panic!("unexpected item: {item:#?}"),
+            data = next_data(&mut server) => data,
+        };
+        assert_eq!(channel_id, 1);
+        assert_eq!(&body[body.len() - 12..body.len() - 8], &[0x81, 206, 0, 2]);
     }
 
     /// Without a window (the default), a late UDP packet is skipped as before.

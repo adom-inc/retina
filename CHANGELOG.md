@@ -1,5 +1,10 @@
 ## unreleased
 
+*   keyframe requests: `Session<Playing>::request_keyframe` (and
+    `Demuxed::request_keyframe`) send an RTCP picture loss indication, or a
+    full intra request, on a stream's RTCP channel or socket, if its SDP offers
+    one (`a=rtcp-fb:<pt> nack pli` or `ccm fir`; see `Stream::supports_pli` and
+    `Stream::supports_fir`).
 *   UDP: optionally reorder RTP packets. `UdpTransportOptions::reorder_window`
     holds packets that arrive ahead of a gap for up to the given window and
     passes them on in sequence order once the gap fills; if the window passes

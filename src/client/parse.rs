@@ -270,8 +270,23 @@ fn parse_media(
     let mut fmtp = None;
     let mut control = None;
     let mut framerate = None;
+    let (mut pli, mut fir) = (false, false);
     for a in &media_description.attributes {
         match a.attribute.as_str() {
+            "rtcp-fb" => {
+                // https://datatracker.ietf.org/doc/html/rfc4585#section-4.2
+                // rtcp-fb-val = (payload type or "*") SP type [SP parameter]: "96 nack pli"
+                // (RFC 4585) or "96 ccm fir" (RFC 5104).
+                let mut words = a.value.as_deref().unwrap_or("").split_ascii_whitespace();
+                let pt = words.next();
+                if pt == Some("*") || pt == Some(rtp_payload_type_str) {
+                    match (words.next(), words.next()) {
+                        (Some("nack"), Some("pli")) => pli = true,
+                        (Some("ccm"), Some("fir")) => fir = true,
+                        _ => {}
+                    }
+                }
+            }
             "rtpmap" => {
                 let v = a
                     .value
@@ -393,6 +408,8 @@ fn parse_media(
         channels,
         framerate,
         direction,
+        pli,
+        fir,
         state: super::StreamState::Uninit,
     })
 }

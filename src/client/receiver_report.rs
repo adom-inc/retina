@@ -48,6 +48,18 @@ const COMPENSATION: f64 = std::f64::consts::E - 1.5;
 /// RTCP packet type for a receiver report (RFC 3550 section 6.4.2).
 const PT_RR: u8 = 201;
 
+/// Payload-specific feedback (RFC 4585 section 6.1).
+const PT_PSFB: u8 = 206;
+
+/// A keyframe request, as payload-specific feedback.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum KeyframeRequest {
+    /// Picture loss indication (RFC 4585 section 6.3.1).
+    Pli,
+    /// Full intra request (RFC 5104 section 4.3.1), with its sequence number.
+    Fir(u8),
+}
+
 /// RTCP packet type for a source description (RFC 3550 section 6.5).
 const PT_SDES: u8 = 202;
 
@@ -439,6 +451,33 @@ impl ReportWriter {
         }
 
         write_sdes_cname(self.ssrc, &self.cname, &mut out);
+        out
+    }
+}
+
+impl ReportWriter {
+    /// Writes a compound packet asking `media_ssrc` for a keyframe: an empty
+    /// receiver report and our `CNAME`, as RFC 4585 section 3.1 requires of
+    /// feedback outside reduced-size RTCP, then the request.
+    pub(crate) fn write_keyframe_request(&self, media_ssrc: u32, req: KeyframeRequest) -> Vec<u8> {
+        let mut out = self.write(None);
+        match req {
+            KeyframeRequest::Pli => {
+                // FMT 1; length 2 (words after the first): sender SSRC, media SSRC.
+                out.extend_from_slice(&[(2 << 6) | 1, PT_PSFB, 0, 2]);
+                out.extend_from_slice(&self.ssrc.to_be_bytes());
+                out.extend_from_slice(&media_ssrc.to_be_bytes());
+            }
+            KeyframeRequest::Fir(seq) => {
+                // FMT 4; length 4: sender SSRC, media SSRC (0, unused), then one
+                // FCI entry: the target SSRC, the sequence number, 3 reserved bytes.
+                out.extend_from_slice(&[(2 << 6) | 4, PT_PSFB, 0, 4]);
+                out.extend_from_slice(&self.ssrc.to_be_bytes());
+                out.extend_from_slice(&0u32.to_be_bytes());
+                out.extend_from_slice(&media_ssrc.to_be_bytes());
+                out.extend_from_slice(&[seq, 0, 0, 0]);
+            }
+        }
         out
     }
 }

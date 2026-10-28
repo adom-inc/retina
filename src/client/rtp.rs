@@ -102,6 +102,11 @@ fn note_stale_live555_data_if_tcp(
 }
 
 impl InorderParser {
+    /// The stream's SSRC, once known from the `PLAY` response or a packet.
+    pub(crate) fn ssrc(&self) -> Option<u32> {
+        self.ssrc.map(|s| s.ssrc)
+    }
+
     pub fn new(
         ssrc: Option<u32>,
         next_seq: Option<u16>,
