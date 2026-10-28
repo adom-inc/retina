@@ -1,5 +1,10 @@
 ## unreleased
 
+*   UDP: optionally reorder RTP packets. `UdpTransportOptions::reorder_window`
+    holds packets that arrive ahead of a gap for up to the given window and
+    passes them on in sequence order once the gap fills; if the window passes
+    first, the missing packets are reported as loss. Off by default, which
+    keeps the old behavior of dropping packets that arrive after a later one.
 *   add `From<SystemTime> for NtpTimestamp` and
     `From<NtpTimestamp> for SystemTime`.
     Correct `NtpTimestamp`'s docs: its seconds wrap every 136 years, and
